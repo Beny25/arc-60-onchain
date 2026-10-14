@@ -1,0 +1,22 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+
+# Foundry build output
+out/
+cache/
+broadcast/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
