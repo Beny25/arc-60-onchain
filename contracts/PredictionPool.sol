@@ -13,6 +13,16 @@ interface AggregatorV3Interface {
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
 }
 
+/// @title ARC 60 PredictionPool (v2)
+/// @notice Parimutuel BTC up/down rounds settled in USDC.
+/// Changes vs v1:
+///  - price feed is immutable, no manual/owner settlement path
+///  - close price must be an oracle update published inside [closeTime, closeTime + SETTLE_WINDOW]
+///  - a round that can't be settled in that window can be voided by anyone -> full refunds
+///  - one-sided rounds are voided (refund, no fee)
+///  - one direction per wallet per round, minimum bet 0.01 USDC
+///  - betting locks `betLock` seconds before close
+///  - fee and reward pool are snapshotted at settlement (owner fee changes can't touch settled rounds)
 contract PredictionPool is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -25,7 +35,8 @@ contract PredictionPool is Ownable, ReentrancyGuard {
         UNSET,
         UP,
         DOWN,
-        TIE
+        TIE,
+        VOID
     }
 
     struct Round {
@@ -35,37 +46,50 @@ contract PredictionPool is Ownable, ReentrancyGuard {
         uint256 closeTime;
         uint256 totalUp;
         uint256 totalDown;
+        uint256 rewardPool; // total pool minus fee, set when a winner is decided
         Result result;
         bool settled;
     }
 
-    uint256 public constant ROUND_DURATION = 60;
-    uint256 public constant MAX_ORACLE_STALENESS = 3600;
+    struct Bet {
+        uint256 amount;
+        Direction direction;
+    }
+
     uint256 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant MAX_FEE_BPS = 1_000;
+    uint256 public constant MIN_ROUND_DURATION = 60;
+    uint256 public constant SETTLE_WINDOW = 300;
+    uint256 public constant MIN_BET = 10_000; // 0.01 USDC, keeps winner payouts from rounding to 0
 
     IERC20 public immutable usdc;
-    address public priceFeed;
+    address public immutable priceFeed;
+    uint256 public immutable roundDuration;
+    uint256 public immutable betLock;
+    uint256 public immutable maxOpenStaleness;
 
     uint256 public currentRoundId;
     uint256 public feeBps;
     uint256 public accruedFees;
 
     mapping(uint256 => Round) public rounds;
-    mapping(uint256 => mapping(address => mapping(Direction => uint256))) private _bets;
+    mapping(uint256 => mapping(address => Bet)) private _bets;
     mapping(uint256 => mapping(address => bool)) public hasClaimed;
 
     error RoundNotOpen();
+    error BettingClosed();
     error RoundNotExpired();
     error AlreadyBet();
     error AlreadyClaimed();
     error RoundNotSettled();
     error InvalidAmount();
-    error OracleNotConfigured();
     error OraclePriceInvalid();
     error OracleStale();
-    error ManualSettleNotAllowed();
+    error CloseNotPublished();
+    error SettleWindowPassed();
+    error SettleWindowOpen();
     error InvalidFeeBps();
+    error InvalidConfig();
     error NothingToClaim();
     error NoFeesToCollect();
     error RoundAlreadySettled();
@@ -75,40 +99,43 @@ contract PredictionPool is Ownable, ReentrancyGuard {
     event RoundStarted(uint256 indexed roundId, int256 openPrice, uint256 closeTime);
     event BetPlaced(uint256 indexed roundId, address indexed bettor, Direction direction, uint256 amount);
     event RoundSettled(uint256 indexed roundId, int256 closePrice, Result result);
+    event RoundVoided(uint256 indexed roundId);
     event Claimed(uint256 indexed roundId, address indexed claimer, uint256 amount);
-    event PriceFeedUpdated(address newFeed);
     event FeeBpsUpdated(uint256 newFeeBps);
+    event FeesCollected(address indexed to, uint256 amount);
 
-    /// @notice Deployer must supply the Arc Testnet BTC/USD Chainlink feed address:
-    /// https://docs.chain.link/data-feeds/price-feeds/addresses?network=arc
-    /// If priceFeed is address(0), oracle settlement is disabled and owner-only
-    /// `settleWithManualPrice` is the fallback settlement path.
-    constructor(address initialOwner, address usdcToken, address initialPriceFeed, uint256 initialFeeBps) Ownable(initialOwner) {
-        if (usdcToken == address(0)) {
-            revert ZeroAddress();
-        }
-        if (initialFeeBps > MAX_FEE_BPS) {
-            revert InvalidFeeBps();
+    constructor(
+        address initialOwner,
+        address usdcToken,
+        address priceFeed_,
+        uint256 roundDuration_,
+        uint256 betLock_,
+        uint256 maxOpenStaleness_,
+        uint256 initialFeeBps
+    ) Ownable(initialOwner) {
+        if (usdcToken == address(0) || priceFeed_ == address(0)) revert ZeroAddress();
+        if (initialFeeBps > MAX_FEE_BPS) revert InvalidFeeBps();
+        if (roundDuration_ < MIN_ROUND_DURATION || betLock_ >= roundDuration_ || maxOpenStaleness_ == 0) {
+            revert InvalidConfig();
         }
 
         usdc = IERC20(usdcToken);
-        priceFeed = initialPriceFeed;
+        priceFeed = priceFeed_;
+        roundDuration = roundDuration_;
+        betLock = betLock_;
+        maxOpenStaleness = maxOpenStaleness_;
         feeBps = initialFeeBps;
     }
 
+    // ───────────────────────────── rounds ─────────────────────────────
+
     function startRound() external returns (uint256 newRoundId) {
-        if (priceFeed == address(0)) {
-            revert OracleNotConfigured();
+        if (currentRoundId != 0 && block.timestamp < rounds[currentRoundId].closeTime) {
+            revert CannotStartRound();
         }
 
-        if (currentRoundId != 0) {
-            Round storage current = rounds[currentRoundId];
-            if (!current.settled && block.timestamp < current.closeTime) {
-                revert CannotStartRound();
-            }
-        }
-
-        int256 openPrice = _readValidatedOraclePrice();
+        (int256 openPrice, uint256 updatedAt) = _readOracle();
+        if (block.timestamp - updatedAt > maxOpenStaleness) revert OracleStale();
 
         newRoundId = currentRoundId + 1;
         currentRoundId = newRoundId;
@@ -116,26 +143,23 @@ contract PredictionPool is Ownable, ReentrancyGuard {
         Round storage round = rounds[newRoundId];
         round.openPrice = openPrice;
         round.openTime = block.timestamp;
-        round.closeTime = block.timestamp + ROUND_DURATION;
+        round.closeTime = block.timestamp + roundDuration;
 
         emit RoundStarted(newRoundId, openPrice, round.closeTime);
     }
 
     function bet(uint256 roundId, Direction direction, uint256 amount) external nonReentrant {
-        if (amount == 0) {
-            revert InvalidAmount();
-        }
+        if (amount < MIN_BET) revert InvalidAmount();
 
         Round storage round = rounds[roundId];
-        if (round.openTime == 0 || block.timestamp >= round.closeTime) {
-            revert RoundNotOpen();
-        }
+        if (round.openTime == 0 || block.timestamp >= round.closeTime) revert RoundNotOpen();
+        if (block.timestamp >= round.closeTime - betLock) revert BettingClosed();
 
-        if (_bets[roundId][msg.sender][direction] != 0) {
-            revert AlreadyBet();
-        }
+        Bet storage b = _bets[roundId][msg.sender];
+        if (b.amount != 0) revert AlreadyBet();
 
-        _bets[roundId][msg.sender][direction] = amount;
+        b.amount = amount;
+        b.direction = direction;
 
         if (direction == Direction.UP) {
             round.totalUp += amount;
@@ -148,87 +172,82 @@ contract PredictionPool is Ownable, ReentrancyGuard {
         emit BetPlaced(roundId, msg.sender, direction, amount);
     }
 
+    /// @notice Anyone can settle once the oracle has published a price at/after closeTime,
+    /// as long as that update (and this call) happen within SETTLE_WINDOW of close.
     function settleRound(uint256 roundId) external {
         Round storage round = rounds[roundId];
 
-        if (round.openTime == 0) {
-            revert RoundNotOpen();
+        if (round.openTime == 0) revert RoundNotOpen();
+        if (round.settled) revert RoundAlreadySettled();
+        if (block.timestamp < round.closeTime) revert RoundNotExpired();
+        if (block.timestamp > round.closeTime + SETTLE_WINDOW) revert SettleWindowPassed();
+
+        (int256 closePrice, uint256 updatedAt) = _readOracle();
+        if (updatedAt < round.closeTime) revert CloseNotPublished();
+
+        round.closePrice = closePrice;
+        round.settled = true;
+
+        uint256 total = round.totalUp + round.totalDown;
+        Result result;
+        if (round.totalUp == 0 || round.totalDown == 0) {
+            result = Result.VOID; // nobody to win against -> refund
+        } else if (closePrice > round.openPrice) {
+            result = Result.UP;
+        } else if (closePrice < round.openPrice) {
+            result = Result.DOWN;
+        } else {
+            result = Result.TIE;
         }
-        if (round.settled) {
-            revert RoundAlreadySettled();
-        }
-        if (block.timestamp < round.closeTime) {
-            revert RoundNotExpired();
-        }
-        if (priceFeed == address(0)) {
-            revert OracleNotConfigured();
+        round.result = result;
+
+        if (result == Result.UP || result == Result.DOWN) {
+            uint256 fee = (total * feeBps) / BPS_DENOMINATOR;
+            accruedFees += fee;
+            round.rewardPool = total - fee;
         }
 
-        int256 closePrice = _readValidatedOraclePrice();
-        _settleRound(roundId, round, closePrice);
+        emit RoundSettled(roundId, closePrice, result);
     }
 
-    function settleWithManualPrice(uint256 roundId, int256 closePrice) external onlyOwner {
-        if (priceFeed != address(0)) {
-            revert ManualSettleNotAllowed();
-        }
-        if (closePrice <= 0) {
-            revert OraclePriceInvalid();
-        }
-
+    /// @notice If nobody could settle inside the window (oracle silent, keeper down), refund everyone.
+    function voidRound(uint256 roundId) external {
         Round storage round = rounds[roundId];
 
-        if (round.openTime == 0) {
-            revert RoundNotOpen();
-        }
-        if (round.settled) {
-            revert RoundAlreadySettled();
-        }
-        if (block.timestamp < round.closeTime) {
-            revert RoundNotExpired();
-        }
+        if (round.openTime == 0) revert RoundNotOpen();
+        if (round.settled) revert RoundAlreadySettled();
+        if (block.timestamp <= round.closeTime + SETTLE_WINDOW) revert SettleWindowOpen();
 
-        _settleRound(roundId, round, closePrice);
+        round.settled = true;
+        round.result = Result.VOID;
+
+        emit RoundVoided(roundId);
     }
 
     function claim(uint256 roundId) external nonReentrant {
         Round storage round = rounds[roundId];
 
-        if (!round.settled) {
-            revert RoundNotSettled();
-        }
-        if (hasClaimed[roundId][msg.sender]) {
-            revert AlreadyClaimed();
-        }
+        if (!round.settled) revert RoundNotSettled();
+        if (hasClaimed[roundId][msg.sender]) revert AlreadyClaimed();
 
-        uint256 upBet = _bets[roundId][msg.sender][Direction.UP];
-        uint256 downBet = _bets[roundId][msg.sender][Direction.DOWN];
-
-        if (upBet == 0 && downBet == 0) {
-            revert NothingToClaim();
-        }
+        Bet memory b = _bets[roundId][msg.sender];
+        if (b.amount == 0) revert NothingToClaim();
 
         uint256 payout;
+        Result result = round.result;
 
-        if (round.result == Result.TIE) {
-            payout = upBet + downBet;
-        } else if (round.result == Result.UP) {
-            if (upBet == 0) {
-                revert NothingToClaim();
-            }
-            payout = _calculateWinnerPayout(upBet, round.totalUp, round.totalUp + round.totalDown);
-        } else if (round.result == Result.DOWN) {
-            if (downBet == 0) {
-                revert NothingToClaim();
-            }
-            payout = _calculateWinnerPayout(downBet, round.totalDown, round.totalUp + round.totalDown);
+        if (result == Result.TIE || result == Result.VOID) {
+            payout = b.amount;
         } else {
-            revert RoundNotSettled();
+            bool won = (result == Result.UP && b.direction == Direction.UP)
+                || (result == Result.DOWN && b.direction == Direction.DOWN);
+            if (!won) revert NothingToClaim();
+
+            uint256 winningPool = result == Result.UP ? round.totalUp : round.totalDown;
+            payout = (round.rewardPool * b.amount) / winningPool;
         }
 
-        if (payout == 0) {
-            revert NothingToClaim();
-        }
+        if (payout == 0) revert NothingToClaim();
 
         hasClaimed[roundId][msg.sender] = true;
         usdc.safeTransfer(msg.sender, payout);
@@ -236,72 +255,56 @@ contract PredictionPool is Ownable, ReentrancyGuard {
         emit Claimed(roundId, msg.sender, payout);
     }
 
-    function setPriceFeed(address newFeed) external onlyOwner {
-        priceFeed = newFeed;
-        emit PriceFeedUpdated(newFeed);
-    }
+    // ───────────────────────────── admin ─────────────────────────────
 
+    /// @notice Only affects rounds settled after the change.
     function setFeeBps(uint256 newFeeBps) external onlyOwner {
-        if (newFeeBps > MAX_FEE_BPS) {
-            revert InvalidFeeBps();
-        }
+        if (newFeeBps > MAX_FEE_BPS) revert InvalidFeeBps();
         feeBps = newFeeBps;
         emit FeeBpsUpdated(newFeeBps);
     }
 
     function collectFees() external onlyOwner nonReentrant {
         uint256 fees = accruedFees;
-        if (fees == 0) {
-            revert NoFeesToCollect();
-        }
+        if (fees == 0) revert NoFeesToCollect();
 
         accruedFees = 0;
         usdc.safeTransfer(owner(), fees);
+        emit FeesCollected(owner(), fees);
     }
 
+    // ───────────────────────────── views ─────────────────────────────
+
+    /// @notice Kept for frontend compatibility: returns the stake only if it was on `direction`.
     function getBet(uint256 roundId, address bettor, Direction direction) external view returns (uint256) {
-        return _bets[roundId][bettor][direction];
+        Bet memory b = _bets[roundId][bettor];
+        return b.direction == direction ? b.amount : 0;
     }
 
-    function _settleRound(uint256 roundId, Round storage round, int256 closePrice) internal {
-        round.closePrice = closePrice;
-        round.settled = true;
+    function getUserBet(uint256 roundId, address bettor) external view returns (uint256 amount, Direction direction) {
+        Bet memory b = _bets[roundId][bettor];
+        return (b.amount, b.direction);
+    }
 
-        if (closePrice > round.openPrice) {
-            round.result = Result.UP;
-        } else if (closePrice < round.openPrice) {
-            round.result = Result.DOWN;
-        } else {
-            round.result = Result.TIE;
+    function claimable(uint256 roundId, address bettor) external view returns (uint256) {
+        Round storage round = rounds[roundId];
+        Bet memory b = _bets[roundId][bettor];
+        if (!round.settled || b.amount == 0 || hasClaimed[roundId][bettor]) return 0;
+
+        if (round.result == Result.TIE || round.result == Result.VOID) return b.amount;
+        if (round.result == Result.UP && b.direction == Direction.UP) {
+            return (round.rewardPool * b.amount) / round.totalUp;
         }
-
-        emit RoundSettled(roundId, closePrice, round.result);
+        if (round.result == Result.DOWN && b.direction == Direction.DOWN) {
+            return (round.rewardPool * b.amount) / round.totalDown;
+        }
+        return 0;
     }
 
-    function _readValidatedOraclePrice() internal view returns (int256 answer) {
-        uint256 updatedAt;
+    // ───────────────────────────── internal ─────────────────────────────
+
+    function _readOracle() internal view returns (int256 answer, uint256 updatedAt) {
         (, answer, , updatedAt, ) = AggregatorV3Interface(priceFeed).latestRoundData();
-
-        if (answer <= 0 || updatedAt == 0 || updatedAt > block.timestamp) {
-            revert OraclePriceInvalid();
-        }
-
-        if (block.timestamp - updatedAt > MAX_ORACLE_STALENESS) {
-            revert OracleStale();
-        }
-    }
-
-    function _calculateWinnerPayout(uint256 userStake, uint256 winningPool, uint256 totalPool)
-        internal
-        returns (uint256 payout)
-    {
-        uint256 grossShare = (totalPool * userStake) / winningPool;
-        uint256 fee = (grossShare * feeBps) / BPS_DENOMINATOR;
-
-        if (fee != 0) {
-            accruedFees += fee;
-        }
-
-        payout = grossShare - fee;
+        if (answer <= 0 || updatedAt == 0 || updatedAt > block.timestamp) revert OraclePriceInvalid();
     }
 }

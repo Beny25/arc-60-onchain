@@ -8,573 +8,344 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 
 contract PredictionPoolTest is Test {
     PredictionPool pool;
-
-    MockUSDC mockUSDC;
-    MockPriceFeed mockPriceFeed;
+    MockUSDC usdc;
+    MockPriceFeed feed;
 
     address owner = address(this);
-    address usdc = address(0x1234);
-    address priceFeed = address(0x5678);
+    address alice = address(0xA11CE);
+    address bob = address(0xB0B);
+    address carol = address(0xCA201);
+
+    uint256 constant DURATION = 300;
+    uint256 constant LOCK = 15;
+    uint256 constant MAX_OPEN_STALE = 120;
+    uint256 constant FEE = 100; // 1%
+    uint256 constant WINDOW = 300; // SETTLE_WINDOW
+
+    PredictionPool.Direction constant UP = PredictionPool.Direction.UP;
+    PredictionPool.Direction constant DOWN = PredictionPool.Direction.DOWN;
 
     function setUp() public {
-        mockUSDC = new MockUSDC();
-        mockPriceFeed = new MockPriceFeed(100_000e8);
-
-        pool = new PredictionPool(
-            owner,
-            address(mockUSDC),
-            address(mockPriceFeed),
-            100
-        );
+        vm.warp(1_700_000_000);
+        usdc = new MockUSDC();
+        feed = new MockPriceFeed(100_000e8);
+        pool = new PredictionPool(owner, address(usdc), address(feed), DURATION, LOCK, MAX_OPEN_STALE, FEE);
     }
 
-    function testConstructorSetsConfiguration() public {
-        assertEq(address(pool.usdc()), address(mockUSDC));
-        assertEq(pool.priceFeed(), address(mockPriceFeed));
-        assertEq(pool.feeBps(), 100);
-        assertEq(pool.currentRoundId(), 0);
+    // ───────── helpers ─────────
+
+    function _bet(address who, PredictionPool.Direction d, uint256 amount) internal {
+        usdc.mint(who, amount);
+        vm.startPrank(who);
+        usdc.approve(address(pool), amount);
+        pool.bet(pool.currentRoundId(), d, amount);
+        vm.stopPrank();
+    }
+
+    function _close(int256 price) internal {
+        (, , , uint256 closeTime, , , , , ) = pool.rounds(pool.currentRoundId());
+        vm.warp(closeTime + 1);
+        feed.setPrice(price);
+    }
+
+    function _result(uint256 id) internal view returns (PredictionPool.Result r) {
+        (, , , , , , , r, ) = pool.rounds(id);
+    }
+
+    function _claim(address who, uint256 id) internal returns (uint256 got) {
+        uint256 before = usdc.balanceOf(who);
+        vm.prank(who);
+        pool.claim(id);
+        got = usdc.balanceOf(who) - before;
+    }
+
+    // ───────── constructor ─────────
+
+    function testConstructorConfig() public view {
+        assertEq(address(pool.usdc()), address(usdc));
+        assertEq(pool.priceFeed(), address(feed));
+        assertEq(pool.roundDuration(), DURATION);
+        assertEq(pool.betLock(), LOCK);
+        assertEq(pool.feeBps(), FEE);
+    }
+
+    function testConstructorRejectsZeroFeed() public {
+        vm.expectRevert(PredictionPool.ZeroAddress.selector);
+        new PredictionPool(owner, address(usdc), address(0), DURATION, LOCK, MAX_OPEN_STALE, FEE);
     }
 
     function testConstructorRejectsZeroUSDC() public {
         vm.expectRevert(PredictionPool.ZeroAddress.selector);
-
-        new PredictionPool(
-            owner,
-            address(0),
-            priceFeed,
-           100
-        );
+        new PredictionPool(owner, address(0), address(feed), DURATION, LOCK, MAX_OPEN_STALE, FEE);
     }
 
-    function testConstructorRejectsFeeAboveMaximum() public {
+    function testConstructorRejectsBadConfig() public {
+        vm.expectRevert(PredictionPool.InvalidConfig.selector);
+        new PredictionPool(owner, address(usdc), address(feed), 59, 0, MAX_OPEN_STALE, FEE);
+
+        vm.expectRevert(PredictionPool.InvalidConfig.selector);
+        new PredictionPool(owner, address(usdc), address(feed), DURATION, DURATION, MAX_OPEN_STALE, FEE);
+
         vm.expectRevert(PredictionPool.InvalidFeeBps.selector);
-
-        new PredictionPool(
-            owner,
-            usdc,
-            priceFeed,
-            1001
-        );
+        new PredictionPool(owner, address(usdc), address(feed), DURATION, LOCK, MAX_OPEN_STALE, 1001);
     }
 
-    function testStartRoundOpensFirstRound() public {
-        uint256 roundId = pool.startRound();
+    // ───────── start ─────────
 
-        (
-            int256 openPrice,
-            ,
-            uint256 openTime,
-            uint256 closeTime,
-            ,
-            ,
-            ,
-            bool settled
-        ) = pool.rounds(roundId);
-
-        assertEq(roundId, 1);
-        assertEq(openPrice, 100_000e8);
-        assertEq(openTime, block.timestamp);
-        assertEq(closeTime, openTime + 60);
+    function testStartRound() public {
+        uint256 id = pool.startRound();
+        (int256 open, , uint256 openTime, uint256 closeTime, , , , , bool settled) = pool.rounds(id);
+        assertEq(id, 1);
+        assertEq(open, 100_000e8);
+        assertEq(closeTime, openTime + DURATION);
         assertFalse(settled);
     }
 
-    function testCannotStartNextRoundBeforeCurrentExpires() public {
+    function testCannotStartBeforeClose() public {
         pool.startRound();
-
         vm.expectRevert(PredictionPool.CannotStartRound.selector);
         pool.startRound();
     }
 
-    function testCanStartNextRoundAfterCurrentExpires() public {
-        uint256 firstRoundId = pool.startRound();
-
-        vm.warp(block.timestamp + 60);
-
-        uint256 secondRoundId = pool.startRound();
-
-        assertEq(firstRoundId, 1);
-        assertEq(secondRoundId, 2);
-        assertEq(pool.currentRoundId(), 2);
-    }
-
-    function testStartRoundRejectsZeroOraclePrice() public {
-        mockPriceFeed.setPrice(0);
-
-        vm.expectRevert(PredictionPool.OraclePriceInvalid.selector);
-        pool.startRound();
-    }
-
-function testStartRoundRejectsNegativeOraclePrice() public {
-    mockPriceFeed.setPrice(-1);
-
-    vm.expectRevert(PredictionPool.OraclePriceInvalid.selector);
-    pool.startRound();
-}
-
-    function testStartRoundRejectsStaleOraclePrice() public {
-        vm.warp(block.timestamp + 3601);
-
+    function testStartRejectsStaleOpenPrice() public {
+        vm.warp(block.timestamp + MAX_OPEN_STALE + 1);
         vm.expectRevert(PredictionPool.OracleStale.selector);
         pool.startRound();
     }
 
-function testBetPlacesUpBet() public {
-    address alice = address(0xA11CE);
-    uint256 amount = 10e6;
-
-    pool.startRound();
-
-    mockUSDC.mint(alice, amount);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-    vm.stopPrank();
-
-uint256 betAmount = pool.getBet(
-    1,
-    alice,
-    PredictionPool.Direction.UP
-);
-
-assertEq(betAmount, amount);
-    assertEq(mockUSDC.balanceOf(address(pool)), amount);
-}
-
-function testCannotBetTwiceOnSameDirection() public {
-    address alice = address(0xA11CE);
-    uint256 amount = 10e6;
-
-    pool.startRound();
-    mockUSDC.mint(alice, 2 * amount);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), 2 * amount);
-
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-
-    vm.expectRevert(PredictionPool.AlreadyBet.selector);
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-
-    vm.stopPrank();
-
-    assertEq(
-        pool.getBet(1, alice, PredictionPool.Direction.UP),
-        amount
-    );
-    assertEq(mockUSDC.balanceOf(address(pool)), amount);
-}
-
-function testCanBetOnBothDirections() public {
-    address alice = address(0xA11CE);
-    uint256 amount = 10e6;
-
-    pool.startRound();
-    mockUSDC.mint(alice, 2 * amount);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), 2 * amount);
-
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-    pool.bet(1, PredictionPool.Direction.DOWN, amount);
-
-    vm.stopPrank();
-
-    assertEq(
-        pool.getBet(1, alice, PredictionPool.Direction.UP),
-        amount
-    );
-    assertEq(
-        pool.getBet(1, alice, PredictionPool.Direction.DOWN),
-        amount
-    );
-    assertEq(mockUSDC.balanceOf(address(pool)), 2 * amount);
-}
-
-function testCannotBetZeroAmount() public {
-    address alice = address(0xA11CE);
-
-    pool.startRound();
-
-    vm.prank(alice);
-    vm.expectRevert(PredictionPool.InvalidAmount.selector);
-    pool.bet(1, PredictionPool.Direction.UP, 0);
-}
-
-function testCannotBetAfterRoundCloses() public {
-    address alice = address(0xA11CE);
-    uint256 amount = 10e6;
-
-    pool.startRound();
-    mockUSDC.mint(alice, amount);
-
-    vm.warp(block.timestamp + 60);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), amount);
-
-    vm.expectRevert(PredictionPool.RoundNotOpen.selector);
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-
-    vm.stopPrank();
-
-    assertEq(mockUSDC.balanceOf(address(pool)), 0);
-}
-
-function testCannotSettleBeforeRoundExpires() public {
-    pool.startRound();
-
-    vm.expectRevert(PredictionPool.RoundNotExpired.selector);
-    pool.settleRound(1);
-}
-
-function testSettleRoundWithHigherPriceResultsInUp() public {
-    pool.startRound();
-
-    vm.warp(block.timestamp + 60);
-    mockPriceFeed.setPrice(101_000e8);
-
-    pool.settleRound(1);
-
-    (
-        int256 openPrice,
-        int256 closePrice,
-        ,
-        ,
-        ,
-        ,
-        PredictionPool.Result result,
-        bool settled
-    ) = pool.rounds(1);
-
-    assertEq(openPrice, 100_000e8);
-    assertEq(closePrice, 101_000e8);
-    assertEq(uint256(result), uint256(PredictionPool.Result.UP));
-    assertTrue(settled);
-}
-
-function testSettleRoundWithLowerPriceResultsInDown() public {
-    pool.startRound();
-
-    vm.warp(block.timestamp + 60);
-    mockPriceFeed.setPrice(99_000e8);
-
-    pool.settleRound(1);
-
-    (
-        ,
-        int256 closePrice,
-        ,
-        ,
-        ,
-        ,
-        PredictionPool.Result result,
-        bool settled
-    ) = pool.rounds(1);
-
-    assertEq(closePrice, 99_000e8);
-    assertEq(uint256(result), uint256(PredictionPool.Result.DOWN));
-    assertTrue(settled);
-}
-
-function testSettleRoundWithSamePriceResultsInTie() public {
-    pool.startRound();
-
-    vm.warp(block.timestamp + 60);
-    mockPriceFeed.setPrice(100_000e8);
-
-    pool.settleRound(1);
-
-    (
-        ,
-        int256 closePrice,
-        ,
-        ,
-        ,
-        ,
-        PredictionPool.Result result,
-        bool settled
-    ) = pool.rounds(1);
-
-    assertEq(closePrice, 100_000e8);
-    assertEq(uint256(result), uint256(PredictionPool.Result.TIE));
-    assertTrue(settled);
-}
-
-function testCannotClaimBeforeRoundIsSettled() public {
-    address alice = address(0xA11CE);
-    uint256 amount = 10e6;
-
-    pool.startRound();
-    mockUSDC.mint(alice, amount);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-
-    vm.expectRevert(PredictionPool.RoundNotSettled.selector);
-    pool.claim(1);
-
-    vm.stopPrank();
-
-    assertEq(mockUSDC.balanceOf(alice), 0);
-    assertEq(mockUSDC.balanceOf(address(pool)), amount);
-}
-
-function testWinnerReceivesPayoutAfterFee() public {
-    address alice = address(0xA11CE);
-    address bob = address(0xB0B);
-
-    uint256 amount = 10e6; // 10 USDC (6 decimals)
-
-    pool.startRound();
-
-    mockUSDC.mint(alice, amount);
-    mockUSDC.mint(bob, amount);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-    vm.stopPrank();
-
-    vm.startPrank(bob);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.DOWN, amount);
-    vm.stopPrank();
-
-    vm.warp(block.timestamp + 60);
-    mockPriceFeed.setPrice(101_000e8);
-
-    pool.settleRound(1);
-
-    vm.prank(alice);
-    pool.claim(1);
-
-    assertEq(mockUSDC.balanceOf(alice), 19_800_000);
-    assertEq(pool.accruedFees(), 200_000);
-}
-
-function testCannotClaimTwice() public {
-    address alice = address(0xA11CE);
-    uint256 amount = 10e6;
-
-    pool.startRound();
-    mockUSDC.mint(alice, amount);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-    vm.stopPrank();
-
-    vm.warp(block.timestamp + 60);
-    mockPriceFeed.setPrice(101_000e8);
-    pool.settleRound(1);
-
-    vm.startPrank(alice);
-    pool.claim(1);
-
-    vm.expectRevert(PredictionPool.AlreadyClaimed.selector);
-    pool.claim(1);
-    vm.stopPrank();
-}
-
-function testLoserCannotClaimPayout() public {
-    address alice = address(0xA11CE);
-    address bob = address(0xB0B);
-    uint256 amount = 10e6;
-
-    pool.startRound();
-
-    mockUSDC.mint(alice, amount);
-    mockUSDC.mint(bob, amount);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-    vm.stopPrank();
-
-    vm.startPrank(bob);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.DOWN, amount);
-    vm.stopPrank();
-
-    vm.warp(block.timestamp + 60);
-    mockPriceFeed.setPrice(99_000e8);
-    pool.settleRound(1);
-
-    vm.prank(alice);
-    vm.expectRevert(PredictionPool.NothingToClaim.selector);
-    pool.claim(1);
-
-    assertEq(mockUSDC.balanceOf(alice), 0);
-}
-
-function testTieRefundsBetToPlayer() public {
-    address alice = address(0xA11CE);
-    uint256 amount = 10e6;
-
-    pool.startRound();
-    mockUSDC.mint(alice, amount);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-    vm.stopPrank();
-
-    vm.warp(block.timestamp + 60);
-    mockPriceFeed.setPrice(100_000e8);
-    pool.settleRound(1);
-
-    vm.prank(alice);
-    pool.claim(1);
-
-    assertEq(mockUSDC.balanceOf(alice), amount);
-    assertEq(mockUSDC.balanceOf(address(pool)), 0);
-}
-
-function testTieRefundsBothDirections() public {
-    address alice = address(0xA11CE);
-    uint256 upAmount = 10e6;
-    uint256 downAmount = 5e6;
-    uint256 totalBet = upAmount + downAmount;
-
-    pool.startRound();
-    mockUSDC.mint(alice, totalBet);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), totalBet);
-    pool.bet(1, PredictionPool.Direction.UP, upAmount);
-    pool.bet(1, PredictionPool.Direction.DOWN, downAmount);
-    vm.stopPrank();
-
-    vm.warp(block.timestamp + 60);
-    mockPriceFeed.setPrice(100_000e8);
-    pool.settleRound(1);
-
-    vm.prank(alice);
-    pool.claim(1);
-
-    assertEq(mockUSDC.balanceOf(alice), totalBet);
-    assertEq(mockUSDC.balanceOf(address(pool)), 0);
-
-    assertEq(
-        pool.getBet(1, alice, PredictionPool.Direction.UP),
-        upAmount
-    );
-    assertEq(
-        pool.getBet(1, alice, PredictionPool.Direction.DOWN),
-        downAmount
-    );
-}
-
-function testOwnerCanCollectAccruedFees() public {
-    address alice = address(0xA11CE);
-    address bob = address(0xB0B);
-
-    uint256 amount = 10e6;
-
-    pool.startRound();
-
-    mockUSDC.mint(alice, amount);
-    mockUSDC.mint(bob, amount);
-
-    vm.startPrank(alice);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.UP, amount);
-    vm.stopPrank();
-
-    vm.startPrank(bob);
-    mockUSDC.approve(address(pool), amount);
-    pool.bet(1, PredictionPool.Direction.DOWN, amount);
-    vm.stopPrank();
-
-    vm.warp(block.timestamp + 60);
-    mockPriceFeed.setPrice(101_000e8);
-    pool.settleRound(1);
-
-    vm.prank(alice);
-    pool.claim(1);
-
-    assertEq(pool.accruedFees(), 200_000);
-
-    uint256 ownerBalanceBefore = mockUSDC.balanceOf(owner);
-
-    pool.collectFees();
-
-    assertEq(pool.accruedFees(), 0);
-    assertEq(
-        mockUSDC.balanceOf(owner),
-        ownerBalanceBefore + 200_000
-    );
-}
-
-function testNonOwnerCannotCollectFees() public {
-    address stranger = address(0xBAD);
-
-    vm.prank(stranger);
-    vm.expectRevert();
-    pool.collectFees();
-}
-
-function testCannotCollectFeesWhenEmpty() public {
-    vm.expectRevert(PredictionPool.NoFeesToCollect.selector);
-    pool.collectFees();
-}
-
-function testCannotStartRoundWithoutOracle() public {
-    pool.setPriceFeed(address(0));
-
-    vm.expectRevert(PredictionPool.OracleNotConfigured.selector);
-    pool.startRound();
-}
-
-function testNonOwnerCannotChangePriceFeed() public {
-    address stranger = address(0xBAD);
-    address newFeed = address(0x9999);
-
-    vm.prank(stranger);
-    vm.expectRevert();
-    pool.setPriceFeed(newFeed);
-
-    assertEq(pool.priceFeed(), address(mockPriceFeed));
-}
-
-function testOwnerCanChangePriceFeed() public {
-    address newFeed = address(0x9999);
-
-    pool.setPriceFeed(newFeed);
-
-    assertEq(pool.priceFeed(), newFeed);
-}
-
-function testStartRoundRejectsFutureOracleTimestamp() public {
-    vm.warp(1_000_000);
-    vm.warp(block.timestamp + 100);
-
-    mockPriceFeed.setPrice(100_000e8);
-
-    vm.warp(block.timestamp - 100);
-
-    vm.expectRevert(PredictionPool.OraclePriceInvalid.selector);
-    pool.startRound();
-}
-
-function testSettlementUsesPriceAtSettlementTime() public {
-    pool.startRound();
-
-    // Ronde berakhir setelah 60 detik.
-    vm.warp(block.timestamp + 60);
-
-    // Settlement terlambat 15 detik.
-    vm.warp(block.timestamp + 15);
-
-    // Mock memberikan harga pada waktu settlement.
-    mockPriceFeed.setPrice(99_000e8);
-
-    pool.settleRound(1);
-
-    (, int256 closePrice,,,,,,) = pool.rounds(1);
-    assertEq(closePrice, 99_000e8);
-}
-
+    function testStartRejectsBadPrice() public {
+        feed.setPrice(0);
+        vm.expectRevert(PredictionPool.OraclePriceInvalid.selector);
+        pool.startRound();
+        feed.setPrice(-1);
+        vm.expectRevert(PredictionPool.OraclePriceInvalid.selector);
+        pool.startRound();
+    }
+
+    // ───────── bet ─────────
+
+    function testBetRecordsStake() public {
+        pool.startRound();
+        _bet(alice, UP, 10e6);
+        assertEq(pool.getBet(1, alice, UP), 10e6);
+        assertEq(pool.getBet(1, alice, DOWN), 0);
+        (, , , , uint256 up, uint256 down, , , ) = pool.rounds(1);
+        assertEq(up, 10e6);
+        assertEq(down, 0);
+    }
+
+    function testOneDirectionPerWallet() public {
+        pool.startRound();
+        _bet(alice, UP, 10e6);
+        usdc.mint(alice, 10e6);
+        vm.startPrank(alice);
+        usdc.approve(address(pool), 10e6);
+        vm.expectRevert(PredictionPool.AlreadyBet.selector);
+        pool.bet(1, DOWN, 10e6);
+        vm.stopPrank();
+    }
+
+    function testBetLockBeforeClose() public {
+        pool.startRound();
+        vm.warp(block.timestamp + DURATION - LOCK);
+        usdc.mint(alice, 1e6);
+        vm.startPrank(alice);
+        usdc.approve(address(pool), 1e6);
+        vm.expectRevert(PredictionPool.BettingClosed.selector);
+        pool.bet(1, UP, 1e6);
+        vm.stopPrank();
+    }
+
+    function testBetJustBeforeLockWorks() public {
+        pool.startRound();
+        vm.warp(block.timestamp + DURATION - LOCK - 1);
+        _bet(alice, UP, 1e6);
+        assertEq(pool.getBet(1, alice, UP), 1e6);
+    }
+
+    function testBetRejectsZeroAndUnknownRound() public {
+        vm.expectRevert(PredictionPool.InvalidAmount.selector);
+        pool.bet(1, UP, 0);
+        vm.expectRevert(PredictionPool.InvalidAmount.selector);
+        pool.bet(1, UP, 9_999);
+        vm.expectRevert(PredictionPool.RoundNotOpen.selector);
+        pool.bet(1, UP, 1e4);
+    }
+
+    // ───────── settle ─────────
+
+    function testSettleRequiresPriceAfterClose() public {
+        pool.startRound();
+        _bet(alice, UP, 1e6);
+        _bet(bob, DOWN, 1e6);
+        (, , , uint256 closeTime, , , , , ) = pool.rounds(1);
+        vm.warp(closeTime + 10); // oracle hasn't updated since open
+        vm.expectRevert(PredictionPool.CloseNotPublished.selector);
+        pool.settleRound(1);
+    }
+
+    function testCannotSettleBeforeClose() public {
+        pool.startRound();
+        vm.expectRevert(PredictionPool.RoundNotExpired.selector);
+        pool.settleRound(1);
+    }
+
+    function testCannotSettleAfterWindow() public {
+        pool.startRound();
+        (, , , uint256 closeTime, , , , , ) = pool.rounds(1);
+        vm.warp(closeTime + WINDOW + 1);
+        feed.setPrice(101_000e8);
+        vm.expectRevert(PredictionPool.SettleWindowPassed.selector);
+        pool.settleRound(1);
+    }
+
+    function testOneSidedRoundIsVoidAndRefunds() public {
+        pool.startRound();
+        _bet(alice, UP, 5e6);
+        _close(110_000e8);
+        pool.settleRound(1);
+        assertEq(uint8(_result(1)), uint8(PredictionPool.Result.VOID));
+        assertEq(_claim(alice, 1), 5e6);
+        assertEq(pool.accruedFees(), 0);
+    }
+
+    function testTieRefundsNoFee() public {
+        pool.startRound();
+        _bet(alice, UP, 3e6);
+        _bet(bob, DOWN, 7e6);
+        _close(100_000e8);
+        pool.settleRound(1);
+        assertEq(uint8(_result(1)), uint8(PredictionPool.Result.TIE));
+        assertEq(_claim(alice, 1), 3e6);
+        assertEq(_claim(bob, 1), 7e6);
+        assertEq(pool.accruedFees(), 0);
+    }
+
+    function testVoidAfterWindowRefunds() public {
+        pool.startRound();
+        _bet(alice, UP, 2e6);
+        _bet(bob, DOWN, 4e6);
+        (, , , uint256 closeTime, , , , , ) = pool.rounds(1);
+
+        vm.warp(closeTime + WINDOW);
+        vm.expectRevert(PredictionPool.SettleWindowOpen.selector);
+        pool.voidRound(1);
+
+        vm.warp(closeTime + WINDOW + 1);
+        pool.voidRound(1);
+        assertEq(_claim(alice, 1), 2e6);
+        assertEq(_claim(bob, 1), 4e6);
+    }
+
+    function testCannotVoidSettledRound() public {
+        pool.startRound();
+        _bet(alice, UP, 1e6);
+        _bet(bob, DOWN, 1e6);
+        _close(101_000e8);
+        pool.settleRound(1);
+        vm.warp(block.timestamp + WINDOW + 10);
+        vm.expectRevert(PredictionPool.RoundAlreadySettled.selector);
+        pool.voidRound(1);
+    }
+
+    // ───────── payouts ─────────
+
+    function testWinnersSplitPoolAfterFee() public {
+        pool.startRound();
+        _bet(alice, UP, 30e6);
+        _bet(carol, UP, 10e6);
+        _bet(bob, DOWN, 60e6);
+        _close(101_000e8);
+        pool.settleRound(1);
+
+        // total 100, fee 1% = 1, reward 99 split 3:1
+        assertEq(pool.accruedFees(), 1e6);
+        assertEq(pool.claimable(1, alice), 74_250_000);
+        assertEq(_claim(alice, 1), 74_250_000);
+        assertEq(_claim(carol, 1), 24_750_000);
+
+        vm.prank(bob);
+        vm.expectRevert(PredictionPool.NothingToClaim.selector);
+        pool.claim(1);
+    }
+
+    function testFeeChangeAfterSettleDoesNotAffectRound() public {
+        pool.startRound();
+        _bet(alice, UP, 50e6);
+        _bet(bob, DOWN, 50e6);
+        _close(99_000e8);
+        pool.settleRound(1);
+
+        pool.setFeeBps(1000);
+        assertEq(_claim(bob, 1), 99e6);
+    }
+
+    function testDoubleClaimReverts() public {
+        pool.startRound();
+        _bet(alice, UP, 1e6);
+        _bet(bob, DOWN, 1e6);
+        _close(101_000e8);
+        pool.settleRound(1);
+        _claim(alice, 1);
+        vm.prank(alice);
+        vm.expectRevert(PredictionPool.AlreadyClaimed.selector);
+        pool.claim(1);
+    }
+
+    function testClaimBeforeSettleReverts() public {
+        pool.startRound();
+        _bet(alice, UP, 1e6);
+        vm.prank(alice);
+        vm.expectRevert(PredictionPool.RoundNotSettled.selector);
+        pool.claim(1);
+    }
+
+    function testCollectFees() public {
+        pool.startRound();
+        _bet(alice, UP, 50e6);
+        _bet(bob, DOWN, 50e6);
+        _close(101_000e8);
+        pool.settleRound(1);
+
+        pool.collectFees();
+        assertEq(usdc.balanceOf(owner), 1e6);
+
+        vm.expectRevert(PredictionPool.NoFeesToCollect.selector);
+        pool.collectFees();
+    }
+
+    function testOnlyOwnerAdmin() public {
+        vm.startPrank(alice);
+        vm.expectRevert();
+        pool.setFeeBps(10);
+        vm.expectRevert();
+        pool.collectFees();
+        vm.stopPrank();
+    }
+
+    // ───────── solvency fuzz ─────────
+
+    function testFuzzPoolStaysSolvent(uint96 a, uint96 b, uint96 c, bool upWins) public {
+        uint256 sa = bound(uint256(a), 1e4, 1e12);
+        uint256 sb = bound(uint256(b), 1e4, 1e12);
+        uint256 sc = bound(uint256(c), 1e4, 1e12);
+
+        pool.startRound();
+        _bet(alice, UP, sa);
+        _bet(carol, UP, sc);
+        _bet(bob, DOWN, sb);
+        _close(upWins ? int256(101_000e8) : int256(99_000e8));
+        pool.settleRound(1);
+
+        if (upWins) {
+            _claim(alice, 1);
+            _claim(carol, 1);
+        } else {
+            _claim(bob, 1);
+        }
+        pool.collectFees();
+
+        // whatever is left is rounding dust, never a deficit
+        assertLe(usdc.balanceOf(address(pool)), 2);
+    }
 }
